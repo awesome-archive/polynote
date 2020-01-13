@@ -8,7 +8,7 @@ import java.util.concurrent.{Executors, LinkedBlockingQueue, ThreadFactory}
 import cats.syntax.traverse._
 import cats.instances.list._
 import jep.python.{PyCallable, PyObject}
-import jep.{Jep, JepConfig, JepException, NamingConventionClassEnquirer, SharedInterpreter, SubInterpreter}
+import jep.{Jep, JepConfig, JepException, MainInterpreter, NamingConventionClassEnquirer, SharedInterpreter, SubInterpreter}
 import polynote.config
 import polynote.config.{PolynoteConfig, pip}
 import polynote.kernel.environment.{Config, CurrentNotebook, CurrentRuntime, CurrentTask}
@@ -17,7 +17,7 @@ import polynote.messages.{CellID, Notebook, NotebookConfig, ShortString, TinyLis
 import polynote.runtime.python.{PythonFunction, PythonObject, TypedPythonObject}
 import zio.internal.{ExecutionMetrics, Executor}
 import zio.blocking.{Blocking, effectBlocking}
-import zio.{Runtime, Task, RIO, UIO, ZIO}
+import zio.{RIO, Runtime, Task, UIO, ZIO}
 import zio.interop.catz._
 
 import scala.collection.JavaConverters._
@@ -34,8 +34,7 @@ class PythonInterpreter private[python] (
   jepBlockingService: Blocking,
   runtime: Runtime[Any],
   pyApi: PythonInterpreter.PythonAPI,
-  venvPath: Option[Path],
-  py4jError: String => Option[Throwable]
+  venvPath: Option[Path]
 ) extends Interpreter {
   import pyApi._
 
@@ -79,8 +78,9 @@ class PythonInterpreter private[python] (
   }
 
   def run(code: String, state: State): RIO[InterpreterEnv, State] = for {
-    parsed    <- parse(code, s"Cell${state.id}")
-    compiled  <- compile(parsed)
+    cell      <- ZIO.succeed(s"Cell${state.id}")
+    parsed    <- parse(code, cell)
+    compiled  <- compile(parsed, cell)
     locals    <- eval[PyObject]("{}")
     globals   <- populateGlobals(state)
     _         <- injectGlobals(globals)
@@ -166,9 +166,9 @@ class PythonInterpreter private[python] (
   }
 
   def init(state: State): RIO[InterpreterEnv, State] = for {
+    globals <- getValue("globals().copy()")
     _       <- exec(setup)
     _       <- exec(matplotlib)
-    globals <- getValue("globals().copy()")
     scope   <- populateGlobals(state)
     _       <- jep { _ =>
       val update = globals.getAttr("update", classOf[PyCallable])
@@ -193,6 +193,9 @@ class PythonInterpreter private[python] (
       |from java.util import ArrayList, HashMap
       |from polynote.kernel import Pos
       |from polynote.kernel import KernelReport
+      |
+      |if not hasattr(sys, 'argv') or len(sys.argv) == 0:
+      |    sys.argv  = ['']
       |
       |class LastExprAssigner(ast.NodeTransformer):
       |
@@ -221,8 +224,16 @@ class PythonInterpreter private[python] (
       |        pos = pos + err.offset
       |        return { 'error': KernelReport(Pos(cell, pos, pos, pos), err.msg, 2) }
       |
-      |def __polynote_compile__(parsed):
-      |    return list(map(lambda node: compile(ast.Module([node]), '<ast>', 'exec'), parsed.body))
+      |def __polynote_compile__(parsed, cell):
+      |    # Python 3.8 compat, see https://github.com/ipython/ipython/pull/11593/files#diff-1c766d4a0b1ea9ed8b2d14058b8234ab
+      |    if sys.version_info > (3,8):
+      |        from ast import Module
+      |    else :
+      |        # mock the new API, ignore second argument
+      |        # see https://github.com/ipython/ipython/issues/11590
+      |        from ast import Module as OriginalModule
+      |        Module = lambda nodelist, ignored: OriginalModule(nodelist)
+      |    return list(map(lambda node: compile(Module([node], []), cell, 'exec'), parsed.body))
       |
       |def __polynote_run__(compiled, _globals, _locals, kernel):
       |    try:
@@ -241,6 +252,7 @@ class PythonInterpreter private[python] (
       |            trace.add(StackTraceElement(frame.filename.split("/")[-1], frame.name, frame.filename, frame.lineno))
       |        result = { 'stack_trace': trace, 'message': getattr(err_val, 'message', str(err_val)), 'class': typ.__name__  }
       |
+      |        # TODO: it's a little ugly that we need to handle py4j stuff here :(
       |        if typ.__name__ == 'Py4JJavaError':
       |            result['py4j_error'] = err.java_exception._target_id
       |
@@ -342,10 +354,10 @@ class PythonInterpreter private[python] (
       }
   }
 
-  protected def compile(parsed: PyObject): Task[PyObject] = jep {
+  protected def compile(parsed: PyObject, cell: String): Task[PyObject] = jep {
     jep =>
       val compile = jep.getValue("__polynote_compile__", classOf[PyCallable])
-      compile.callAs(classOf[PyObject], parsed)
+      compile.callAs(classOf[PyObject], parsed, cell)
   }
 
   protected def run(compiled: PyObject, globals: PyObject, locals: PyObject, state: State): RIO[CurrentRuntime, State] =
@@ -384,7 +396,10 @@ class PythonInterpreter private[python] (
                       case "bool" => (typeOf[Boolean], valueAs(classOf[java.lang.Boolean]).booleanValue())
                       case "function" | "builtin_function_or_method" | "type" =>
                         (typeOf[PythonFunction], new PythonFunction(valueAs(classOf[PyCallable]), runner))
-                      case "PyJObject" | "PyJCallable" | "PyJAutoCloseable" =>
+
+                      // TODO: can we get better type information from `PyJArray`?
+                      // Types that start with "PyJ*" are actually Java values wrapped by jep for use in Python
+                      case other if other.startsWith("PyJ") =>
                         val jValue = valueAs(classOf[Object])
                         val typ = runtime.unsafeRun(compiler.reflect(jValue)).symbol.info
                         (typ, jValue)
@@ -401,16 +416,18 @@ class PythonInterpreter private[python] (
               PythonState(state.id, state.prev, resultValues.toList, globals)
 
             case trace =>
-              val cause = Option(get.callAs(classOf[String], "py4j_error")).flatMap(py4jError)
+              val cause = errorCause(get)
               val message = get.callAs(classOf[String], "message")
               val typ = get.callAs(classOf[String], "class")
-              val els = trace.asScala.map(_.asInstanceOf[StackTraceElement]).toArray
+              val els = trace.asScala.map(_.asInstanceOf[StackTraceElement]).reverse.toArray // python stack traces are backwards from java!
               val err = cause.fold(new RuntimeException(s"$typ: $message"))(new RuntimeException(s"$typ: $message", _))
               err.setStackTrace(els)
               throw err
           }
       }
     }
+
+  protected def errorCause(get: PyCallable): Option[Throwable] = None
 
   case class PythonState(id: CellID, prev: State, values: List[ResultValue], globalsDict: PyObject) extends State {
     override def withPrev(prev: State): State = copy(prev = prev)
@@ -469,16 +486,19 @@ object PythonInterpreter {
     }
   }
 
-  // TODO: pull this from configuration?
-  private[python] def sharedModules: List[String] = List("numpy", "google")
-
-  private[python] def mkJep(venv: Option[Path], sharedModules: List[String]): RIO[ScalaCompiler.Provider, Jep] = ZIO.accessM[ScalaCompiler.Provider](_.scalaCompiler.classLoader).flatMap {
+  private[python] def mkJep(venv: Option[Path]): RIO[ScalaCompiler.Provider, Jep] = ZIO.accessM[ScalaCompiler.Provider](_.scalaCompiler.classLoader).flatMap {
     classLoader => ZIO {
       val conf = new JepConfig()
-        .addSharedModules(sharedModules: _*)
         .setClassLoader(classLoader)
         .setClassEnquirer(new NamingConventionClassEnquirer(true).addTopLevelPackageName("polynote"))
-      val interp = new SubInterpreter(conf)
+
+      try {
+        SharedInterpreter.setConfig(conf)
+      } catch  {
+        case e: JepException => // we can only set the SharedInterpreter config once, but there's no way to tell if we've already set it :\
+      }
+
+      val interp = new SharedInterpreter()
       venv.foreach(path => interp.exec(s"""exec(open("$path/bin/activate_this.py").read(), {'__file__': "$path/bin/activate_this.py"})"""))
       interp
     }
@@ -490,20 +510,22 @@ object PythonInterpreter {
     }
   }
 
-  def apply(
-    venv: Option[Path],
-    sharedModules: List[String] = PythonInterpreter.sharedModules,
-    py4jError: String => Option[Throwable] = _ => None
-  ): RIO[ScalaCompiler.Provider, PythonInterpreter] = {
+  def interpreterDependencies(venv: Option[Path]): ZIO[ScalaCompiler.Provider, Throwable, (ScalaCompiler, Jep, Executor, AtomicReference[Thread], Blocking, Runtime[Any], PythonAPI)] = {
     val jepThread = new AtomicReference[Thread](null)
     for {
       compiler <- ZIO.access[ScalaCompiler.Provider](_.scalaCompiler)
       executor <- compiler.classLoader >>= jepExecutor(jepThread)
-      jep      <- mkJep(venv, sharedModules).lock(executor)
+      jep      <- mkJep(venv).lock(executor)
       blocking  = mkJepBlocking(executor)
       api      <- effectBlocking(new PythonAPI(jep)).lock(executor).provide(blocking)
       runtime  <- ZIO.runtime[Any]
-    } yield new PythonInterpreter(compiler, jep, executor, jepThread, blocking, runtime, api, venv, py4jError)
+    } yield (compiler, jep, executor, jepThread, blocking, runtime, api)
+  }
+
+  def apply(venv: Option[Path]): RIO[ScalaCompiler.Provider, PythonInterpreter] = {
+    for {
+      (compiler, jep, executor, jepThread, blocking, runtime, api) <- interpreterDependencies(venv)
+    } yield new PythonInterpreter(compiler, jep, executor, jepThread, blocking, runtime, api, venv)
   }
 
   object Factory extends Interpreter.Factory {

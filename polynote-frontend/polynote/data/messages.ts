@@ -61,6 +61,19 @@ export class LoadNotebook extends Message {
     }
 }
 
+export class CloseNotebook extends Message {
+    static codec = combined(shortStr).to(CloseNotebook);
+    static get msgTypeId() { return 27; }
+    static unapply(inst: CloseNotebook): ConstructorParameters<typeof CloseNotebook> {
+        return [inst.path];
+    }
+
+    constructor(readonly path: string) {
+        super();
+        Object.freeze(this);
+    }
+}
+
 
 export class NotebookCells extends Message {
     static codec =
@@ -444,13 +457,41 @@ export class ListNotebooks extends Message {
 }
 
 export class CreateNotebook extends Message {
-    static codec = combined(shortStr, optional(either(shortStr, str as Codec<string>))).to(CreateNotebook);
+    static codec = combined(shortStr, optional(str)).to(CreateNotebook);
     static get msgTypeId() { return 14; }
     static unapply(inst: CreateNotebook): ConstructorParameters<typeof CreateNotebook> {
-        return [inst.path, inst.uriOrContents];
+        return [inst.path, inst.content];
     }
 
-    constructor(readonly path: string, readonly uriOrContents?: Left<string> | Right<string>) {
+    constructor(readonly path: string, readonly content?: string) {
+        super();
+        Object.freeze(this);
+    }
+}
+
+export class RenameNotebook extends Message {
+    static codec = combined(shortStr, shortStr).to(RenameNotebook);
+    static get msgTypeId() { return 25; }
+    static unapply(inst: RenameNotebook): ConstructorParameters<typeof RenameNotebook> {
+        return [inst.path, inst.newPath];
+    }
+    constructor(readonly path: string, readonly newPath: string) {
+        super();
+        Object.freeze(this);
+    }
+
+    isResponse(other: Message): boolean {
+        return (other instanceof RenameNotebook) && other.path === this.path;
+    }
+}
+
+export class DeleteNotebook extends Message {
+    static codec = combined(shortStr).to(DeleteNotebook);
+    static get msgTypeId() { return 26; }
+    static unapply(inst: DeleteNotebook): ConstructorParameters<typeof DeleteNotebook> {
+        return [inst.path];
+    }
+    constructor(readonly path: string) {
         super();
         Object.freeze(this);
     }
@@ -679,6 +720,9 @@ Message.codecs = [
     SetCellOutput,   // 22
     NotebookVersion, // 23
     RunningKernels,  // 24
+    RenameNotebook,  // 25
+    DeleteNotebook,  // 26
+    CloseNotebook,   // 27
 ];
 
 

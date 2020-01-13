@@ -28,7 +28,11 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
         |  port: 8193
         |
         |storage:
-        |  dir: foo
+        |  cache: tmp
+        |  dir: notebooks
+        |  mounts:
+        |    examples:
+        |      dir: examples
         |
         |# Default repositories can be specified. Uncommenting the following lines would add four default repositories which are inherited by new notebooks.
         |repositories:
@@ -59,6 +63,11 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
         |  spark.driver.userClasspathFirst: true
         |  spark.executor.userClasspathFirst: true
         |
+        |# Credentials. This list contains the list of credentials used to access the repositories
+        |
+        |credentials:
+        |  coursier:
+        |    path: ~/.config/coursier/credentials.properties
       """.stripMargin
 
     val parsed = yaml.parser.parse(yamlStr).flatMap(_.as[PolynoteConfig])
@@ -68,7 +77,7 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
         host = "1.1.1.1",
         port = 8193
       ),
-      Storage("foo"),
+      Storage("tmp", dir = "notebooks", Map("examples" -> Mount("examples"))),
       List(
         ivy("https://my-artifacts.org/artifacts/"),
         ivy(
@@ -82,8 +91,47 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
       ),
       List("org.typelevel", "com.mycompany"),
       Map("scala" -> List("org.typelevel:cats-core_2.11:1.6.0", "com.mycompany:my-library:jar:all:1.0.0")),
-      Map("spark.driver.userClasspathFirst" -> "true", "spark.executor.userClasspathFirst" -> "true")
+      Map("spark.driver.userClasspathFirst" -> "true", "spark.executor.userClasspathFirst" -> "true"),
+      credentials = Credentials(
+        coursier = Some(Credentials.Coursier("~/.config/coursier/credentials.properties"))
+      )
     )
 
+  }
+
+  it should "Parse Shared Classes" in {
+    val yamlStr =
+      """
+        |behavior:
+        |  shared_packages:
+        |    - com.esotericsoftware.kryo
+        |    - org.myclass
+      """.stripMargin
+
+    val parsed = PolynoteConfig.parse(yamlStr)
+
+    parsed.right.value.behavior.sharedPackages shouldEqual List("com.esotericsoftware.kryo", "org.myclass")
+    parsed.right.value.behavior.getSharedString shouldEqual
+      "^(com.esotericsoftware.kryo|org.myclass|scala|javax?|jdk|sun|com.sun|com.oracle|polynote|org.w3c|org.xml|org.omg|org.ietf|org.jcp|org.apache.spark|org.spark_project|org.glassfish.jersey|org.jvnet.hk2|org.apache.hadoop|org.codehaus|org.slf4j|org.log4j|org.apache.log4j)\\."
+  }
+
+  it should "handle empty configurations" in {
+    val yamlStr = ""
+
+    val parsed = PolynoteConfig.parse(yamlStr)
+    val defaultConfig = PolynoteConfig()
+    parsed.right.value shouldEqual defaultConfig
+  }
+
+  it should "handle comment-only configurations" in {
+    val yamlStr =
+      """
+        |# some yaml comment
+        |# another comment
+        |""".stripMargin
+
+    val parsed = PolynoteConfig.parse(yamlStr)
+    val defaultConfig = PolynoteConfig()
+    parsed.right.value shouldEqual defaultConfig
   }
 }

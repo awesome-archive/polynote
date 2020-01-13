@@ -5,7 +5,7 @@ import cats.data.StateT
 import cats.syntax.traverse._
 import cats.instances.list._
 import org.scalatest.{FreeSpec, Matchers}
-import polynote.kernel.{Output, Result, ResultValue, ScalaCompiler, TaskInfo}
+import polynote.kernel.{CompletionType, Output, Result, ResultValue, ScalaCompiler, TaskInfo}
 import polynote.testing.{InterpreterSpec, ValueMap, ZIOSpec}
 import polynote.messages.CellID
 import zio.{RIO, ZIO}
@@ -35,10 +35,26 @@ class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
     ValueMap(result.state.values) shouldEqual Map("foo" -> 22)
   }
 
-  "capture standard output" in {
-    val result = interp1("""println("hello")""")
+  "capture standard output" - {
+    "single-line string" in {
+      val result = interp1("""println("hello")""")
+      stdOut(result.env.publishResult.toList.runIO()) shouldEqual "hello\n"
+    }
 
-    stdOut(result.env.publishResult.toList.runIO()) shouldEqual "hello\n"
+    "multi-line string" in {
+      val result = interp1(
+        s"""println(">>>Multi-line string")
+          |println(${"\"\"\""}A: 1
+          |    |B: 2
+          |    |C: 3${"\"\"\""}.stripMargin)
+          |""".stripMargin)
+      stdOut(result.env.publishResult.toList.runIO()) shouldEqual
+        """>>>Multi-line string
+          |A: 1
+          |B: 2
+          |C: 3
+          |""".stripMargin
+    }
   }
 
   "bring values from previous cells" in {
@@ -104,6 +120,60 @@ class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
     }
   }
 
+  "package cells" - {
+    "imports classes" in {
+      val test = for {
+        _ <- interp("package foo\nclass Foo(a: Int, b: String) { def bar = a + b.length }")
+        _ <- interp("""val a = new Foo(10, "hi")""")
+        _ <- interp("val b = a.bar")
+      } yield ()
+
+      val (finalState, _) = test.run(cellState).runIO()
+      val scopeMap = finalState.scope.map(r => r.name.toString -> r.value).toMap
+      scopeMap("b") shouldEqual 12
+    }
+
+    "imports objects" in {
+      val test = for {
+        _ <- interp("package fooObj\nobject Foo { def wizzle = 20 }")
+        _ <- interp("val a = Foo.wizzle")
+      } yield ()
+
+      val (finalState, _) = test.run(cellState).runIO()
+      val scopeMap = finalState.scope.map(r => r.name.toString -> r.value).toMap
+      scopeMap("a") shouldEqual 20
+    }
+
+    "case classes (class with companion)" in {
+      val test = for {
+        _ <- interp("package fooCaseClass\ncase class Foo(a: Int, b: Int)")
+        _ <- interp("val a = Foo(10, 20)")
+        _ <- interp("val c = classOf[Foo]")
+        _ <- interp("val b = a.b")
+      } yield ()
+
+      val (finalState, _) = test.run(cellState).runIO()
+      val scopeMap = finalState.scope.map(r => r.name.toString -> r.value).toMap
+      scopeMap("b") shouldEqual 20
+    }
+
+    "class with explicit companion" in {
+      val test = for {
+        _ <- interp(
+          """package explicitCompanion
+            |sealed abstract class TestClass { def m = 10 }
+            |object TestClass extends TestClass""".stripMargin)
+        _ <- interp("val result = TestClass.m")
+        _ <- interp("val cls = classOf[TestClass]")
+      } yield ()
+
+      val (finalState, _) = test.run(cellState).runIO()
+      val scopeMap = finalState.scope.map(r => r.name.toString -> r.value).toMap
+      scopeMap("result") shouldEqual 10
+      scopeMap("cls").asInstanceOf[Class[_]].getSimpleName shouldEqual "TestClass"
+    }
+  }
+
   /**
     * This test takes a while, so it's disabled by default. The purpose is to make sure that the cell encoding
     * doesn't fail at the typer stage before the constructor arguments are pruned, because there's at least one
@@ -140,6 +210,15 @@ class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
     val (finalState, results) = interp("val foo257 = 257").run(State.id(257, prevState)).runIO()
     ValueMap(results.state.values) shouldEqual Map("foo257" -> 257)
     ValueMap(results.state.scope) shouldEqual (0 to 257).map(i => s"foo$i" -> i).toMap
+  }
+
+  "lazy vals don't crash" in {
+    val test = for {
+      _ <- interp("lazy val x = 10")
+      _ <- interp("val y = x * 2")
+    } yield ()
+    val (finalState, _) = test.run(cellState).runIO()
+    ValueMap(finalState.scope)("y") shouldEqual 20
   }
 
   "cases from previous scala interpreter" - {
@@ -260,6 +339,65 @@ class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
         (vars, output) =>
           vars.toSeq should contain theSameElementsAs List("foo" -> 1, "bar" -> "one")
       }
+    }
+
+  }
+
+  "completions" - {
+    def completionsMap(code: String, pos: Int, state: State = cellState) =
+      interpreter.completionsAt(code, pos, state).runIO().groupBy(_.name.toString)
+
+    "complete class defined in cell" in {
+      val code = """class Foo() {
+                   |  def someMethod(): Int = 22
+                   |}
+                   |
+                   |val test = new Foo()
+                   |test.""".stripMargin
+      val completions = completionsMap(code, code.length)
+      val List(someMethod) = completions("someMethod")
+      someMethod.completionType shouldEqual CompletionType.Method
+      someMethod.resultType shouldEqual "Int"
+    }
+
+    "inside apply trees" - {
+      "one level deep" in {
+        val code =
+          """class Foo() { def someMethod(): Int = 22 }
+            |val test = new Foo()
+            |val result = println(test.)
+            |""".stripMargin
+        val completions = completionsMap(code, code.indexOf("test.") + "test.".length)
+        val List(someMethod) = completions("someMethod")
+        someMethod.completionType shouldEqual CompletionType.Method
+        someMethod.resultType shouldEqual "Int"
+      }
+    }
+
+    "imported method" in {
+      val state = interp1("import scala.math.log10").state
+      val completions = completionsMap("l", 1, State.id(2, state))
+      val List(log10) = completions("log10")
+      log10.completionType shouldEqual CompletionType.Method
+      log10.resultType shouldEqual "Double"
+    }
+
+    "extension methods" in {
+      val state = interp1("import scala.collection.JavaConverters._").state
+      val code = "List(1, 2, 3).asJ"
+      val completions = completionsMap(code, code.length, State.id(2, state))
+      val List(asJava) = completions("asJava")
+      asJava.completionType shouldEqual CompletionType.Method
+      asJava.resultType shouldEqual "List[Int]"
+    }
+
+    "value from previous cell" in {
+      val state = interp1("val shouldBeVisible = 10").state
+      val code = "val butIsIt = sh"
+      val completions = completionsMap(code, code.length, State.id(2, state))
+      val List(shouldBeVisible) = completions("shouldBeVisible")
+      shouldBeVisible.completionType shouldEqual CompletionType.Term
+      shouldBeVisible.resultType shouldEqual "Int"
     }
 
   }

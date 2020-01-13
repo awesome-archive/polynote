@@ -4,11 +4,11 @@ package scal
 
 import java.lang.reflect.{Constructor, InvocationTargetException}
 
-import scala.reflect.internal.util.NoPosition
+import scala.reflect.internal.util.{NoPosition, Position}
 import scala.tools.nsc.interactive.Global
 import polynote.messages.CellID
 import zio.blocking.{Blocking, effectBlocking}
-import zio.{Task, RIO, ZIO}
+import zio.{RIO, Task, ZIO}
 import ScalaInterpreter.{addPositionUpdates, captureLastExpression}
 import polynote.kernel.environment.CurrentRuntime
 
@@ -27,26 +27,26 @@ class ScalaInterpreter private[scal] (
     collectedState <- injectState(collectState(state))
     valDefs         = collectedState.values.mapValues(_._1).values.toList
     cellCode       <- scalaCompiler.cellCode(s"Cell${state.id.toString}", code, collectedState.prevCells, valDefs, collectedState.imports)
-      .flatMap(_.transformCode(transformCode).pruneInputs())
+      .flatMap(_.transformStats(transformCode).pruneInputs())
     inputNames      = cellCode.inputs.map(_.name.decodedName.toString)
     inputs          = inputNames.map(collectedState.values).map(_._2)
     cls            <- scalaCompiler.compileCell(cellCode)
-    resultInstance <- runClass(cls, cellCode, inputs, state)
-    resultValues   <- getResultValues(state.id, cellCode, resultInstance)
+    resultInstance <- cls.map(cls => runClass(cls, cellCode, inputs, state).map(Some(_))).getOrElse(ZIO.succeed(None))
+    resultValues   <- resultInstance.map(resultInstance => getResultValues(state.id, cellCode, resultInstance)).getOrElse(ZIO.succeed(Nil))
   } yield ScalaCellState(state.id, state.prev, resultValues, cellCode, resultInstance)
 
-  override def completionsAt(code: String, pos: Int, state: State): Task[List[Completion]] = for {
+  override def completionsAt(code: String, pos: Int, state: State): RIO[Blocking, List[Completion]] = for {
     collectedState   <- injectState(collectState(state)).provide(CurrentRuntime.NoCurrentRuntime)
     valDefs           = collectedState.values.mapValues(_._1).values.toList
-    cellCode         <- scalaCompiler.cellCode(s"Cell${state.id.toString}", s"\n${code.substring(0, math.min(pos, code.length))}", collectedState.prevCells, valDefs, collectedState.imports, strictParse = false)
-    completions      <- completer.completions(cellCode, pos + 1)
+    cellCode         <- scalaCompiler.cellCode(s"Cell${state.id.toString}", s"\n\n${code.substring(0, math.min(pos, code.length))}  ", collectedState.prevCells, valDefs, collectedState.imports, strictParse = false)
+    completions      <- completer.completions(cellCode, pos + 2)
   } yield completions
 
-  override def parametersAt(code: String, pos: Int, state: State): Task[Option[Signatures]] = for {
+  override def parametersAt(code: String, pos: Int, state: State): RIO[Blocking, Option[Signatures]] = for {
     collectedState <- injectState(collectState(state)).provide(CurrentRuntime.NoCurrentRuntime)
     valDefs         = collectedState.values.mapValues(_._1).values.toList
-    cellCode       <- scalaCompiler.cellCode(s"Cell${state.id.toString}", s"\n$code", collectedState.prevCells, valDefs, collectedState.imports, strictParse = false)
-    hints          <- completer.paramHints(cellCode, pos + 1)
+    cellCode       <- scalaCompiler.cellCode(s"Cell${state.id.toString}", s"\n\n$code  ", collectedState.prevCells, valDefs, collectedState.imports, strictParse = false)
+    hints          <- completer.paramHints(cellCode, pos + 2)
   } yield hints
 
   override def init(state: State): RIO[InterpreterEnv, State] = ZIO.succeed(state)
@@ -107,7 +107,7 @@ class ScalaInterpreter private[scal] (
   private def collectState(state: State): CollectedState = state.prev.collect {
     case ScalaCellState(_, _, values, cellCode, _) =>
       val valuesMap = values.map(v => v.name -> v.value).toMap
-      val inputs = cellCode.typedOutputs.map(_.duplicate.setPos(NoPosition))
+      val inputs = cellCode.typedOutputs.map(cleanInput)
         .flatMap {
           v =>
             val (nameString, input) = v.name.decodedName.toString match {
@@ -127,12 +127,18 @@ class ScalaInterpreter private[scal] (
   }.foldRight(CollectedState()) {
     case ((nextInputs, cellCode), CollectedState(inputs, imports, priorCells)) =>
       val nextImports = cellCode.map(_.splitImports()).getOrElse(Imports(Nil, Nil))
-      CollectedState(inputs ++ nextInputs, nextImports ++ imports, cellCode.map(_ :: priorCells).getOrElse(priorCells))
+      CollectedState(inputs ++ nextInputs, imports ++ nextImports, cellCode.map(_ :: priorCells).getOrElse(priorCells))
   }
+
+  /**
+    * Ensure an input [[ValDef]] is suitable as a constructor parameter
+    */
+  private def cleanInput(input: ValDef): ValDef =
+    input.copy(mods = input.mods &~ global.Flag.LAZY).duplicate.setPos(NoPosition)
 
   private def collectPrevInstances(code: CellCode, state: State): List[AnyRef] = {
     val allInstances = state.prev.collect {
-      case ScalaCellState(_, _, _, cellCode, inst) => cellCode.cellClassSymbol -> inst
+      case ScalaCellState(_, _, _, cellCode, Some(inst)) => cellCode.cellClassSymbol -> inst
     }.toMap
 
     val usedInstances = code.priorCells.map {
@@ -189,7 +195,7 @@ class ScalaInterpreter private[scal] (
     * A [[State]] implementation for Scala cells. It tracks the CellCode and the instance of the cell class, which
     * we'll need to pass into future cells if they use types, classes, etc from this cell.
     */
-  case class ScalaCellState(id: CellID, prev: State, values: List[ResultValue], cellCode: CellCode, instance: AnyRef) extends State {
+  case class ScalaCellState(id: CellID, prev: State, values: List[ResultValue], cellCode: CellCode, instance: Option[AnyRef]) extends State {
     override def withPrev(prev: State): ScalaCellState = copy(prev = prev)
     override def updateValues(fn: ResultValue => ResultValue): State = copy(values = values.map(fn))
     override def updateValuesM[R](fn: ResultValue => RIO[R, ResultValue]): RIO[R, State] =
@@ -222,15 +228,19 @@ object ScalaInterpreter {
   def addPositionUpdates(global: Global)(trees: List[global.Tree]): List[global.Tree] = {
     import global._
     val numTrees = trees.size
+    if (numTrees == 0) return Nil
+    val lastTree = trees.last
     trees.zipWithIndex.flatMap {
       case (tree, index) =>
         val treeProgress = Literal(Constant(index.toDouble / numTrees))
         val lineStr = s"Line ${tree.pos.line}"
+        val sPos = tree.pos.makeTransparent
         // code to notify kernel of progress in the cell
-        def setProgress(detail: String) = q"""kernel.setProgress($treeProgress, ${Literal(Constant(detail))})"""
+        def setProgress(detail: String) =
+          atPos(sPos)(q"""kernel.setProgress($treeProgress, ${Literal(Constant(detail))})""")
         def setPos(mark: Tree) =
           if(mark.pos.isRange)
-            Some(q"""kernel.setExecutionStatus(${Literal(Constant(mark.pos.start))}, ${Literal(Constant(mark.pos.end))})""")
+            Some(atPos(sPos)(q"""kernel.setExecutionStatus(${Literal(Constant(mark.pos.start))}, ${Literal(Constant(mark.pos.end))})"""))
           else None
 
         def wrapWithProgress(name: String, tree: Tree): List[Tree] =
@@ -242,7 +252,7 @@ object ScalaInterpreter {
           case tree: global.Import => List(tree)
           case tree => wrapWithProgress(lineStr, tree)
         }
-    } :+ q"kernel.clearExecutionStatus()"
+    } :+ atPos(lastTree.pos.makeTransparent)(q"kernel.clearExecutionStatus()")
   }
 
   trait Factory extends Interpreter.Factory {

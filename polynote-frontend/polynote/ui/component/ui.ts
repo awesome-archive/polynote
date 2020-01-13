@@ -17,7 +17,7 @@ import {
     ServerVersion,
     RunningKernels,
     KernelCommand,
-    LoadNotebook, CellsLoaded
+    LoadNotebook, CellsLoaded, RenameNotebook, DeleteNotebook, TabRemoved, TabRenamed
 } from '../util/ui_event'
 import {Cell, CellContainer, CodeCell, CodeCellModel} from "./cell"
 import {div, span, TagElement} from '../util/tags'
@@ -31,7 +31,7 @@ import {SplitView} from "./split_view";
 import {KernelUI} from "./kernel_ui";
 import {NotebookUI} from "./notebook";
 import {TabUI} from "./tab";
-import {NotebookListUI} from "./notebook_list";
+import {CreateNotebookDialog, RenameNotebookDialog, NotebookListUI} from "./notebook_list";
 import {HomeUI} from "./home";
 import {Either} from "../../data/types";
 import {SocketSession} from "../../comms";
@@ -81,7 +81,9 @@ export class MainUI extends UIMessageTarget {
             }
         });
         // TODO: remove listeners on children.
-        this.subscribe(CreateNotebook, () => this.createNotebook());
+        this.subscribe(CreateNotebook, (path) => this.createNotebook(path));
+        this.subscribe(RenameNotebook, path => this.renameNotebook(path));
+        this.subscribe(DeleteNotebook, path => this.deleteNotebook(path));
         this.subscribe(ImportNotebook, (name, content) => this.importNotebook(name, content));
         this.subscribe(UIToggle, (which, force) => {
             if (which === "NotebookList") {
@@ -113,6 +115,18 @@ export class MainUI extends UIMessageTarget {
             this.currentServerCommit = serverCommit;
         });
 
+        SocketSession.get.addMessageListener(
+            messages.RenameNotebook,
+            (oldPath, newPath) => this.onNotebookRenamed(oldPath, newPath));
+
+        SocketSession.get.addMessageListener(
+            messages.DeleteNotebook,
+            path => this.onNotebookDeleted(path));
+
+        SocketSession.get.addMessageListener(
+            messages.CreateNotebook,
+            actualPath => this.browseUI.addItem(actualPath));
+
         SocketSession.get.addEventListener('close', evt => {
            this.browseUI.setDisabled(true);
            this.toolbarUI.setDisabled(true);
@@ -135,7 +149,7 @@ export class MainUI extends UIMessageTarget {
 
         this.subscribe(TabActivated, (name, type) => {
             if (type === 'notebook') {
-                const tabPath = `/notebook/${name}`;
+                const tabUrl = new URL(`notebook/${name}`, document.baseURI);
 
                 const href = window.location.href;
                 const hash = window.location.hash;
@@ -143,11 +157,11 @@ export class MainUI extends UIMessageTarget {
                 document.title = title; // looks like chrome ignores history title so we need to be explicit here.
 
                  // handle hashes and ensure scrolling works
-                if (hash && window.location.pathname === tabPath) {
+                if (hash && window.location.href === tabUrl.href) {
                     window.history.pushState({notebook: name}, title, href);
                     this.handleHashChange()
                 } else {
-                    window.history.pushState({notebook: name}, title, tabPath);
+                    window.history.pushState({notebook: name}, title, tabUrl.href);
                 }
 
                 const currentNotebook = this.tabUI.getTab(name).content.notebook.cellsUI;
@@ -158,10 +172,22 @@ export class MainUI extends UIMessageTarget {
                 }
             } else if (type === 'home') {
                 const title = 'Polynote';
-                window.history.pushState({notebook: name}, title, '/');
+                window.history.pushState({notebook: name}, title, document.baseURI);
                 document.title = title;
                 this.toolbarUI.setDisabled(true);
             }
+        });
+
+        this.subscribe(TabRenamed, (oldName, newName, type, isCurrent) => {
+            if (isCurrent) {
+                const tabUrl = new URL(`notebook/${name}`, document.baseURI);
+                const href = window.location.hash ? `${tabUrl.href}#${window.location.hash.replace(/^#/, '')}` : tabUrl.href;
+                window.history.replaceState({notebook: newName}, `${newName.split(/\//g).pop()} | Polynote`, href);
+            }
+        });
+
+        this.subscribe(TabRemoved, path => {
+            SocketSession.get.send(new messages.CloseNotebook(path))
         });
 
         window.addEventListener('hashchange', evt => {
@@ -253,39 +279,65 @@ export class MainUI extends UIMessageTarget {
         })
     }
 
-    createNotebook() {
-        const handler = SocketSession.get.addMessageListener(messages.CreateNotebook, (actualPath) => {
-            SocketSession.get.removeMessageListener(handler);
-            this.browseUI.addItem(actualPath);
-            this.loadNotebook(actualPath);
-        });
+    createNotebook(path?: string) {
+        CreateNotebookDialog.prompt(path).then(
+            notebookPath => {
+                if (notebookPath) {
+                    SocketSession.get.listenOnceFor(messages.CreateNotebook, actualPath => {
+                        if (actualPath.substring(0, notebookPath.length) === notebookPath) {
+                            this.loadNotebook(actualPath);
+                        }
+                    });
+                    SocketSession.get.send(new messages.CreateNotebook(notebookPath));
+                }
+            }
+        ).catch(() => null)
+    }
 
-        const notebookPath = prompt("Enter the name of the new notebook (no need for an extension)");
-        if (notebookPath) {
-            SocketSession.get.send(new messages.CreateNotebook(notebookPath))
+    renameNotebook(path: string) {
+        // Existing listener will hear broadcast and update UI
+        RenameNotebookDialog.prompt(path)
+            .then(newPath => SocketSession.get.send(new messages.RenameNotebook(path, newPath)))
+    }
+
+    onNotebookRenamed(oldPath: string, newPath: string) {
+        this.browseUI.renameItem(oldPath, newPath);
+        const newName =  newPath.split(/\//g).pop();
+        this.tabUI.renameTab(oldPath, newPath, newName);
+
+        storage.update<{name: string, path: string}[]>('recentNotebooks', recentNotebooks => {
+            return recentNotebooks.map(nb => {
+                if (nb.path === oldPath) {
+                    nb.name = newName || newPath;
+                    nb.path = newPath;
+                    return nb
+                } else return nb
+            });
+        })
+    }
+
+    deleteNotebook(path: string) {
+        // Existing listener will hear broadcast and update UI
+        // TODO: this should probably get its own dialog too, for consistency
+        if (confirm(`Permanently delete ${path}?`)) {
+            SocketSession.get.send(new messages.DeleteNotebook(path))
         }
     }
 
-    importNotebook(name?: string, content?: string) {
-        const handler = SocketSession.get.addMessageListener(messages.CreateNotebook, (actualPath) => {
-            SocketSession.get.removeMessageListener(handler);
-            this.browseUI.addItem(actualPath);
+    onNotebookDeleted(path: string) {
+        this.browseUI.removeItem(path);
+
+        // remove from recent notebooks
+        storage.update<{name: string, path: string}[]>('recentNotebooks', recentNotebooks => {
+            return recentNotebooks.filter(nb => nb.path !== path)
+        })
+    }
+
+    importNotebook(name: string, content: string) {
+        SocketSession.get.listenOnceFor(messages.CreateNotebook, (actualPath) => {
             this.loadNotebook(actualPath);
         });
-
-        if (name && content) { // the evt has all we need
-            SocketSession.get.send(new messages.CreateNotebook(name, Either.right(content)));
-        } else {
-            const userInput = prompt("Enter the full URL of another Polynote instance.");
-            const notebookURL = userInput && new URL(userInput);
-
-            if (notebookURL && notebookURL.protocol.startsWith("http")) {
-                const nbFile = decodeURI(notebookURL.pathname.split("/").pop()!);
-                notebookURL.search = "download=true";
-                notebookURL.hash = "";
-                SocketSession.get.send(new messages.CreateNotebook(nbFile, Either.left(notebookURL.href)));
-            }
-        }
+        SocketSession.get.send(new messages.CreateNotebook(name, content));
     }
 
     handleHashChange() {

@@ -1,6 +1,7 @@
 'use strict';
 
 import { Message } from './data/messages'
+import {EventTarget} from 'event-target-shim'
 
 export class PolynoteMessageEvent<T extends Message> extends CustomEvent<any> {
     constructor(readonly message: T) {
@@ -12,8 +13,23 @@ export class PolynoteMessageEvent<T extends Message> extends CustomEvent<any> {
 type ListenerCallback = (...args: any[]) => void
 export type MessageListener = [typeof Message, ListenerCallback, boolean?];
 
+const mainEl = document.getElementById('Main');
+const socketKey = mainEl ? mainEl.getAttribute('data-ws-key') : null;
+window.addEventListener("beforeunload", evt => {
+    const sess = SocketSession.tryGet;
+    if (sess && sess.isOpen) {
+        sess.close();
+    }
+});
+
 export class SocketSession extends EventTarget {
     private static inst: SocketSession;
+
+    static get tryGet(): SocketSession | null {
+        if (SocketSession.inst)
+            return SocketSession.inst;
+        return null;
+    }
 
     static get get() {
         if (!SocketSession.inst) {
@@ -31,8 +47,9 @@ export class SocketSession extends EventTarget {
     }
 
     mkSocket() {
-        const schema = location.protocol === 'https:' ? 'wss://' : 'ws://';
-        this.socket = new WebSocket(schema + document.location.host + '/ws');
+        const wsUrl = new URL(`ws?key=${socketKey}`, document.baseURI);
+        wsUrl.protocol = wsUrl.protocol === "https:" ? 'wss:' : 'ws';
+        this.socket = new WebSocket(wsUrl.href);
         this.socket.binaryType = 'arraybuffer';
         this.listeners = {
             message: this.receive.bind(this),
@@ -83,9 +100,13 @@ export class SocketSession extends EventTarget {
                 this.dispatchEvent(new PolynoteMessageEvent(msg)); // this is how `request` works.
 
                 for (const handler of this.messageListeners) {
-                    if (msg instanceof handler[0]) { // check not redundant even though IntelliJ complains.
-                        const result = handler[1].apply(null, handler[0].unapply(msg));
-                        if (handler[2] && result === false) {
+                    const msgType = handler[0];
+                    const listenerCB = handler[1];
+                    const removeWhenFalse = handler[2];
+
+                    if (msg instanceof msgType) { // check not redundant even though IntelliJ complains.
+                        const result = listenerCB.apply(null, msgType.unapply(msg));
+                        if (removeWhenFalse && (result === false || result === undefined)) {
                             this.removeMessageListener(handler);
                         }
                     }

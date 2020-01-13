@@ -1,6 +1,85 @@
-# UNRELEASED 
+# 0.2.16 (Jan 9, 2020)
 
-* 
+* Fixed some plotting and streaming data bugs 
+* Better completions 
+* Refactor the way notebook files are encoded/decoded and stored. Also fixes some issues in Zeppelin notebook import. 
+* Address `serialize-javascript` vulnerability
+* New hotkey, `Shift+F10`, to run all cells (thanks @kuckjwi0928) 
+* Additional bugfixes and improvements
+
+# 0.2.15 (Dec 28, 2019)
+
+* Improved completions for Scala
+* Fixed regression in python+spark interpreter where `kernel` (and thus matplotlib) isn't available.
+
+# 0.2.14 (Dec 18, 2019)
+
+* `<base>` tag can now be configured and works properly
+* Renaming notebooks works properly
+* Fixed plot editor buttons
+* Improved docker build (thanks @mathematicalmichael and @JD557)
+* Removed `pysparksession` (`spark` now works properly in pyspark)
+* More improvements to python interpreter (stack traces, red squigglies, etc)
+* Compiles against JDK11 (thanks @aborg0)
+* Lazy vals don't cause errors (but still aren't really lazy)
+* Identity provider framework and header-based authentication
+* Timeout when searching for `ReprsOf`
+* Fix resolution of some ivy/maven artifacts (thanks @JD557)
+* Fix drag-and-drop events in Firefox (thanks @JD557)
+* Support Safari (thanks @calmarj)
+* Support ivy/maven credentials as coursier credentials.properties (thanks @JD557)
+* Misc bugfixes improvements to remote kernel reliability
+
+# 0.2.13 (Nov 7, 2019)
+
+* Improve remote kernel error handling
+* Make LimitedSharingClassLoader configurable (thanks @ghoto !)
+* Remove `sun.misc.Cleaner` which is messes up JDK9+
+* Resolve insecure py4j gateway issue (thanks again, @ghoto !)
+* Fix bug in handling empty configs
+* Add ability to specify multiple storage mounts
+
+# 0.2.12 (Nov 5, 2019)
+
+* Updated notebook list UI, with ability to rename and delete notebooks (right click), navigate with keyboard, etc
+* Fixed classloading bug causing e.g. #588
+* Don't override spark.app.name if it's set in the spark config
+* Fix bug causing issues importing shared modules installed inside virtual environments
+* Publish snapshot artifacts of all modules to sonatype
+
+# 0.2.11 (October 31, 2019)
+    
+* Happy Halloween! This spoooooky release includes some minor bugfixes!
+* Remove scala from the runtime assembly jars
+* Set Python's sys.argv to prevent some libraries from complaining
+* Configurable base URI, useful when behind a proxy
+
+# 0.2.10 (October 30, 2019)
+
+* Fix an NPE when trying to encode a null string
+* Fix issue with package cells not working at all when Spark is enabled
+* Self-host some external resources (font-awesome icons and katex)
+* Fix critical issue in plot aggregations for collections-of-case-classes
+* Attempt to fit initial plot size into available area in plot editor (fixes axes being cut off when window is too small)
+
+# 0.2.9 (October 29, 2019)
+
+* *New Python Runscript* which should hopefully help people who have been having trouble linking with Jep
+* *Improved Security* by adding a unique websocket key generated on server start, reducing the chance of attacks on 
+  the local websocket by malicious users 
+* *Support for `package` definitions in Scala Cells*: users can now define package cells that are independent from other 
+  notebook cells, useful for solving serialization issues and other problems. 
+* Update Scala to `2.11.12` fixing the error people were having on JDK 9+
+* Fix a bug with numeric aggregations (thanks @JD557 !)
+* Fix a bug causing compatibility issues on newer JVMs (thanks @diesalbla)
+* Fix a bug causing missing state when new interpreters are started in the middle of a notebook session
+* Fix compatibility with Python 3.8
+* No longer shadowing Scala SparkSession variable `spark` in Python cells. PySpark users should use the `pysparksession` 
+  variable to access Pyspark's SparkSession. This is a temporary solution until we have a better one in place. 
+
+# 0.2.8 (October 23, 2019)
+
+* Fixes a dependency clash which was causing `NoSuchMethodError` and similar.
 
 # 0.2.7 (October 23, 2019)
 

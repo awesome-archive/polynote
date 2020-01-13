@@ -1,16 +1,16 @@
 package polynote.config
 
 import java.io.{File, FileNotFoundException, FileReader}
+import java.util.UUID
 
 import cats.syntax.either._
 import io.circe.generic.extras.semiauto._
+import io.circe.syntax._
 import io.circe._
 import polynote.kernel.TaskB
 import polynote.kernel.logging.Logging
 import zio.ZIO
 import zio.blocking.effectBlocking
-
-import scala.collection.parallel.Task
 
 final case class Listen(
   port: Int = 8192,
@@ -22,11 +22,18 @@ object Listen {
   implicit val decoder: Decoder[Listen] = deriveDecoder
 }
 
-final case class Storage(dir: String = "notebooks", cache: String = "tmp")
+final case class Mount(dir: String, mounts: Map[String, Mount] = Map.empty)
+
+object Mount {
+  implicit val encoder: ObjectEncoder[Mount] = deriveEncoder
+  implicit val decoder: Decoder[Mount] = deriveDecoder[Mount]
+}
+
+final case class Storage(cache: String = "tmp", dir: String = "notebooks", mounts: Map[String, Mount] = Map.empty)
 
 object Storage {
   implicit val encoder: ObjectEncoder[Storage] = deriveEncoder
-  implicit val decoder: Decoder[Storage] = deriveDecoder
+  implicit val decoder: Decoder[Storage] = deriveDecoder[Storage]
 }
 
 sealed trait KernelIsolation
@@ -51,12 +58,57 @@ object KernelIsolation {
 
 final case class Behavior(
   dependencyIsolation: Boolean = true,
-  kernelIsolation: KernelIsolation = KernelIsolation.SparkOnly
-)
+  kernelIsolation: KernelIsolation = KernelIsolation.Always,
+  sharedPackages: List[String] = Nil
+) {
+  private final val defaultShares = "scala|javax?|jdk|sun|com.sun|com.oracle|polynote|org.w3c|org.xml|org.omg|org.ietf|org.jcp|org.apache.spark|org.spark_project|org.glassfish.jersey|org.jvnet.hk2|org.apache.hadoop|org.codehaus|org.slf4j|org.log4j|org.apache.log4j"
+
+  def getSharedString: String = "^(" + (sharedPackages :+ defaultShares).mkString("|") + ")\\."
+}
 
 object Behavior {
   implicit val encoder: ObjectEncoder[Behavior] = deriveEncoder
   implicit val decoder: Decoder[Behavior] = deriveDecoder
+}
+
+final case class AuthProvider(provider: String, config: JsonObject)
+
+object AuthProvider {
+  implicit val encoder: ObjectEncoder[AuthProvider] = deriveEncoder
+  implicit val decoder: Decoder[AuthProvider] = deriveDecoder
+}
+
+final case class Security(
+  websocketKey: Option[String] = None,
+  auth: Option[AuthProvider] = None
+)
+
+object Security {
+  implicit val encoder: ObjectEncoder[Security] = deriveEncoder
+  implicit val decoder: Decoder[Security] = deriveDecoder
+}
+
+final case class UI(
+  baseUri: String = "/"
+)
+
+object UI {
+  implicit val encoder: ObjectEncoder[UI] = deriveEncoder
+  implicit val decoder: Decoder[UI] = deriveDecoder
+}
+
+case class Credentials(
+  coursier: Option[Credentials.Coursier] = None
+)
+object Credentials {
+  final case class Coursier(path: String)
+  object Coursier {
+    implicit val encoder: ObjectEncoder[Coursier] = deriveEncoder
+    implicit val decoder: Decoder[Coursier] = deriveDecoder
+  }
+
+  implicit val encoder: ObjectEncoder[Credentials] = deriveEncoder
+  implicit val decoder: Decoder[Credentials] = deriveDecoder
 }
 
 final case class PolynoteConfig(
@@ -66,7 +118,10 @@ final case class PolynoteConfig(
   exclusions: List[String] = Nil,
   dependencies: Map[String, List[String]] = Map.empty,
   spark: Map[String, String] = Map.empty,
-  behavior: Behavior = Behavior()
+  behavior: Behavior = Behavior(),
+  security: Security = Security(),
+  ui: UI = UI(),
+  credentials: Credentials = Credentials()
 )
 
 
@@ -81,7 +136,11 @@ object PolynoteConfig {
   private def parseFile(file: File): TaskB[Json] =
     effectBlocking(file.exists()).flatMap {
       case true => effectBlocking(new FileReader(file)).bracketAuto {
-        reader => ZIO.fromEither(yaml.parser.parse(reader))
+        reader => ZIO.fromEither(yaml.parser.parse(reader)).map {
+          json =>
+            // if the config is empty, its Json value is "false"... (reliable sources indicate this is part of the yaml spec)
+            if (json.isBoolean) Json.fromJsonObject(JsonObject.empty) else json
+        }
       }
       case false => ZIO.succeed(Json.fromJsonObject(JsonObject.empty))
     }

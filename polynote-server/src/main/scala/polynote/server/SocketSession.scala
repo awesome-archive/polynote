@@ -6,8 +6,8 @@ import cats.{Applicative, MonadError}
 import cats.effect.{Concurrent, Timer}
 import cats.syntax.traverse._
 import cats.instances.list._
-import fs2.{Pipe, Stream}
-import fs2.concurrent.Queue
+import fs2.Stream
+import fs2.concurrent.{Queue, Topic}
 import org.http4s.Response
 import org.http4s.server.websocket.WebSocketBuilder
 import org.http4s.websocket.WebSocketFrame
@@ -15,40 +15,44 @@ import org.http4s.websocket.WebSocketFrame.Binary
 import polynote.buildinfo.BuildInfo
 import polynote.kernel
 import polynote.kernel.util.{Publish, RefMap}
-import polynote.kernel.{BaseEnv, ClearResults, GlobalEnv, Kernel, StreamOps, StreamingHandles, TaskG, UpdatedTasks}
+import polynote.kernel.{BaseEnv, ClearResults, StreamOps, StreamingHandles, TaskG, UpdatedTasks}
 import polynote.kernel.environment.{Env, PublishMessage}
 import polynote.kernel.interpreter.Interpreter
 import polynote.kernel.logging.Logging
 import polynote.messages._
-import zio.{Promise, Task, RIO, ZIO}
+import polynote.server.auth.{Identity, IdentityProvider, UserIdentity}
+import zio.{Promise, RIO, Task, ZIO}
 
 import scala.collection.immutable.SortedMap
 import scala.concurrent.duration.{Duration, SECONDS}
 
 class SocketSession(
-  handler: SessionHandler
+  handler: SessionHandler,
+  broadcastAll: Topic[Task, Option[Message]]
 )(implicit ev: MonadError[Task, Throwable], ev2: Concurrent[TaskG], ev3: Concurrent[Task], ev4: Timer[Task], ev5: Applicative[RIO[PublishMessage, ?]]) {
 
   private def toFrame(message: Message): Task[Binary] = {
     Message.encode[Task](message).map(bits => Binary(bits.toByteVector))
   }
 
-  lazy val toResponse: TaskG[Response[Task]] = for {
+  lazy val toResponse: RIO[SessionEnv, Response[Task]] = for {
     input     <- Queue.unbounded[Task, WebSocketFrame]
     output    <- Queue.unbounded[Task, WebSocketFrame]
     processor <- process(input, output)
-    fiber     <- processor.interruptWhen(handler.awaitClosed).compile.drain.fork
-    keepalive <- Stream.awakeEvery[Task](Duration(10, SECONDS)).map(_ => WebSocketFrame.Ping()).through(output.enqueue).compile.drain.fork
+    fiber     <- processor.interruptWhen(handler.awaitClosed).compile.drain.ignore.fork
+    keepalive <- Stream.awakeEvery[Task](Duration(10, SECONDS)).map(_ => WebSocketFrame.Ping()).through(output.enqueue).compile.drain.ignore.fork
+    allOutputs = Stream.emits(Seq(output.dequeue, broadcastAll.subscribe(128).unNone.evalMap(toFrame))).parJoinUnbounded
+    logging   <- ZIO.access[Logging](identity)
     response  <- WebSocketBuilder[Task].build(
-      output.dequeue.terminateAfter(_.isInstanceOf[WebSocketFrame.Close]),
+      allOutputs.terminateAfter(_.isInstanceOf[WebSocketFrame.Close]) ++ Stream.eval(handler.close()).drain,
       input.enqueue,
-      onClose = keepalive.interrupt *> fiber.interrupt.unit)
+      onClose = keepalive.interrupt *> fiber.interrupt.unit *> handler.close())
   } yield response
 
   private def process(
     input: Queue[Task, WebSocketFrame],
     output: Queue[Task, WebSocketFrame]
-  ): ZIO[BaseEnv with GlobalEnv, Nothing, Stream[Task, Unit]] = Env.enrich[BaseEnv with GlobalEnv](PublishMessage.of(Publish(output).contraFlatMap(toFrame))).map {
+  ): ZIO[SessionEnv, Nothing, Stream[Task, Unit]] = Env.enrich[SessionEnv](PublishMessage.of(Publish(output).contraFlatMap(toFrame))).map {
     env =>
       Stream.eval(handshake.provide(env)).evalMap(env.publishMessage.publish1) ++ input.dequeue.flatMap {
         case WebSocketFrame.Close(_) => Stream.eval(output.enqueue1(WebSocketFrame.Close())).drain
@@ -80,15 +84,21 @@ class SessionHandler(
   streamingHandles: StreamingHandles with BaseEnv
 )(implicit ev: MonadError[Task, Throwable], ev2: Concurrent[TaskG], ev3: Concurrent[Task], ev4: Timer[Task], ev5: Applicative[RIO[PublishMessage, ?]]) {
 
-  def accept(message: Message): RIO[BaseEnv with GlobalEnv with PublishMessage, Unit] =
+  import auth.Permission
+  import IdentityProvider.checkPermission
+
+  def accept(message: Message): RIO[SessionEnv with PublishMessage, Unit] =
     handler.applyOrElse(message, unhandled)
 
   def awaitClosed: ZIO[Any, Nothing, Either[Throwable, Unit]] = closed.await.either
+  def close(): Task[Unit] = closed.succeed(()).unit
 
-  private def subscribe(path: String): RIO[BaseEnv with GlobalEnv with PublishMessage, KernelSubscriber] = subscribed.getOrCreate(path) {
+  private def subscribe(path: String): RIO[SessionEnv with PublishMessage, KernelSubscriber] = subscribed.getOrCreate(path) {
     for {
+      _               <- checkPermission(Permission.ReadNotebook(path))
       kernelPublisher <- notebookManager.open(path)
       subscriber      <- kernelPublisher.subscribe()
+      _               <- closed.await.flatMap(_ => subscriber.close()).fork
       _               <- subscriber.closed.await.flatMap(_ => subscribed.remove(path)).fork
       _               <- kernelPublisher.closed.await.flatMap(_ => subscriber.close()).fork
     } yield subscriber
@@ -96,7 +106,7 @@ class SessionHandler(
 
   private def unhandled(msg: Message): RIO[BaseEnv, Unit] = Logging.warn(s"Unhandled message type ${msg.getClass.getName}")
 
-  private val handler: PartialFunction[Message, RIO[BaseEnv with GlobalEnv with PublishMessage, Unit]] = {
+  private val handler: PartialFunction[Message, RIO[SessionEnv with PublishMessage, Unit]] = {
     case ListNotebooks(_) =>
       notebookManager.list().flatMap {
         notebooks => PublishMessage(ListNotebooks(notebooks.map(ShortString.apply)))
@@ -122,23 +132,41 @@ class SessionHandler(
           } yield ()
       }
 
-    case CreateNotebook(path, maybeUriOrContent) =>
-      notebookManager.create(path, maybeUriOrContent).flatMap {
-        realPath => PublishMessage(CreateNotebook(ShortString(realPath)))
+    case CloseNotebook(path) =>
+      subscribed.get(path).flatMap {
+        case None             => ZIO.unit
+        case Some(subscriber) => subscriber.close()
       }
 
-    case upConfig @ UpdateConfig(path, _, _, config) => for {
-      subscriber <- subscribe(path)
-      _          <- subscriber.update(upConfig)
-      _          <- subscriber.publisher.restartKernel(forceStart = false)
-    } yield ()
+    case CreateNotebook(path, maybeContent) =>
+      checkPermission(Permission.CreateNotebook(path)) *> notebookManager.create(path, maybeContent).unit
+
+    case RenameNotebook(path, newPath) =>
+      checkPermission(Permission.CreateNotebook(newPath)) *>
+        checkPermission(Permission.DeleteNotebook(path)) *>
+        notebookManager.rename(path, newPath).unit
+
+    case DeleteNotebook(path) =>
+      checkPermission(Permission.DeleteNotebook(path)) *> notebookManager.delete(path)
+
+    case upConfig @ UpdateConfig(path, _, _, config) =>
+      for {
+        _          <- checkPermission(Permission.ModifyNotebook(path))
+        subscriber <- subscribe(path)
+        _          <- subscriber.update(upConfig)
+        _          <- subscriber.publisher.restartKernel(forceStart = false)
+      } yield ()
 
     case NotebookUpdate(update) =>
-      subscribe(update.notebook).flatMap(_.update(update))
+      checkPermission(Permission.ModifyNotebook(update.notebook)) *>
+        subscribe(update.notebook).flatMap(_.update(update))
 
     case RunCell(path, ids) =>
-      subscribe(path).flatMap {
-        subscriber => ids.map(id => subscriber.publisher.queueCell(id)).sequence.flatMap(_.sequence).unit
+      if (ids.isEmpty) ZIO.unit else {
+        ids.map(id => checkPermission(Permission.ExecuteCell(path, id))).reduce(_ *> _) *>
+          subscribe(path).flatMap {
+            subscriber => ids.map(id => subscriber.publisher.queueCell(id)).sequence.flatMap(_.sequence).unit
+          }
       }
 
     case req@CompletionsAt(notebook, id, pos, _) => for {
@@ -223,13 +251,16 @@ class SessionHandler(
 }
 
 object SocketSession {
-  def apply()(implicit ev: MonadError[Task, Throwable], ev2: Concurrent[TaskG], ev3: Concurrent[Task], ev4: Timer[Task], ev5: Applicative[RIO[PublishMessage, ?]]): RIO[BaseEnv with NotebookManager, SocketSession] = for {
+  def apply(
+    broadcastAll: Topic[Task, Option[Message]]
+  )(implicit ev: MonadError[Task, Throwable], ev2: Concurrent[TaskG], ev3: Concurrent[Task], ev4: Timer[Task], ev5: Applicative[RIO[PublishMessage, ?]]): RIO[BaseEnv with NotebookManager, SocketSession] = for {
     notebookManager  <- NotebookManager.access
     subscribed       <- RefMap.empty[String, KernelSubscriber]
     closed           <- Promise.make[Throwable, Unit]
     sessionId        <- ZIO.effectTotal(sessionId.getAndIncrement())
     streamingHandles <- Env.enrichM[BaseEnv](StreamingHandles.make(sessionId))
-  } yield new SocketSession(new SessionHandler(notebookManager, subscribed, closed, streamingHandles))
+    handler           = new SessionHandler(notebookManager, subscribed, closed, streamingHandles)
+  } yield new SocketSession(handler, broadcastAll)
 
   private val sessionId = new AtomicInteger(0)
 }

@@ -1,12 +1,39 @@
-package polynote.server.repository.ipynb
+package polynote.server.repository.format.ipynb
 
-import io.circe.{Decoder, Json, JsonObject}
+import io.circe.{Decoder, Json, JsonObject, Printer}
 import io.circe.syntax._
 import io.circe.generic.semiauto._
-import polynote.server.repository.ipynb.JupyterOutput.{DisplayData, Error, ExecuteResult}
+import io.circe.parser.parse
+import polynote.kernel.environment.Config
+import polynote.kernel.{BaseEnv, GlobalEnv}
+import polynote.messages.{Notebook, NotebookConfig}
+import polynote.server.repository.format.NotebookFormat
+import polynote.server.repository.format.ipynb.JupyterOutput.{DisplayData, Error, ExecuteResult}
+import zio.{RIO, ZIO}
+
+import scala.collection.immutable.StringOps
+
+/**
+  * Format that decodes Zeppelin json but encodes ipynb
+  */
+class ZeppelinToIpynbFormat extends IPythonFormat {
+  override val extension: String = "json"
+
+  override def decodeNotebook(noExtPath: String, rawContent: String): RIO[BaseEnv with GlobalEnv, Notebook] = {
+    for {
+      parsed <- ZIO.fromEither(parse(rawContent))
+      zep <- ZIO.fromEither(parsed.as[ZeppelinNotebook])
+      config <- Config.access
+    } yield {
+      val nbConfig = Option(NotebookConfig.empty.copy(sparkConfig = Option(config.spark)))
+      val content = JupyterNotebook.toNotebook(zep.toJupyterNotebook).copy(config = nbConfig)
+      content.toNotebook(s"$noExtPath.ipynb") // Note the extension being overridden to ipynb here.
+    }
+  }
+}
+
 
 // Conversion for Zeppelin notebooks. Lossy, only supports decoding.
-
 final case class ZeppelinNotebook(
   paragraphs: List[ZeppelinParagraph],
   name: String
@@ -120,7 +147,7 @@ final case class ZeppelinOutput(
     case INCOMPLETE => None
     case ERROR =>
 
-      val iter = data.lines
+      val iter = new StringOps(data).lines
       val firstException = iter.next().split(":")
 
       Option(Error(
@@ -133,7 +160,7 @@ final case class ZeppelinOutput(
   }
 
   def zepTableHTML(zepData: String): String = {
-    val itr = zepData.lines
+    val itr = new StringOps(zepData).lines
     val header = itr.next().split("\t")
     val headerHTML = header.mkString("<th>", "</th><th>", "</th>")
     val rowsHTML = itr.toSeq.map(_.split("\t").mkString("<td>", "</td><td>", "</td>")).mkString("<tr>", "</tr><tr>", "</tr>")
